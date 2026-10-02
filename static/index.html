@@ -11,7 +11,8 @@
     <h1>透明图层叠序校准台</h1>
     <p class="subtitle">
       录入 2～7 个纯色透明图层与 1～4 组「背景色 / 目标色」样本，
-      在线性光空间中枚举所有底→顶叠放顺序，按未取整 RGB 平方误差总和选最优。
+      在线性光空间中枚举所有底→顶叠放顺序，按未取整 RGB 平方误差总和选最优；
+      先后关系成环时，会在冲突提示旁给出待确认的最少删除方案。
     </p>
   </header>
 
@@ -21,6 +22,7 @@
       <div id="errorBanner" class="error-banner" hidden>
         <div class="error-title">输入有误，已暂停计算：</div>
         <ul id="errorList"></ul>
+        <div id="cyclePlan" class="cycle-plan" hidden></div>
       </div>
 
       <!-- 图层 -->

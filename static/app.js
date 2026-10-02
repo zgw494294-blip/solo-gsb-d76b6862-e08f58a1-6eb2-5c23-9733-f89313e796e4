@@ -23,12 +23,26 @@ let lastErrorKey = "";
 let inflightToken = 0;
 let lastSolveResult = null; // 最近一次成功的求解结果（供过渡面板重置/默认上限）
 
+// 成环解除方案：随每次 /api/solve 并行请求一次 /api/resolve-cycle。
+// 只有「最近一次且图层/样本/关系始终未变」的方案请求能更新方案视图；
+// 图层、样本或关系一变化（哪怕之后改回原值），在途方案请求立即作废、
+// 已展示方案立即失去确认资格，旧请求的成功 / HTTP 错误 / 连接异常均被丢弃。
+const cycleState = {
+  result: null,       // 最近一次有效方案响应（cyclic=true 时）
+  resultSig: "",      // 方案产生时的输入指纹（确认资格凭据）
+  solveCyclic: false, // 当前求解周期是否已确认收到成环 400
+  inflightId: 0,      // 当前仍可落地的方案在途请求序号；0 表示无
+  inflightSig: "",    // 在途方案请求发出时的输入指纹
+  reqSeq: 0,          // 单调递增、永不归零的请求序号源
+};
+
 const $ = (sel) => document.querySelector(sel);
 const elLayers = $("#layers");
 const elSamples = $("#samples");
 const elRelations = $("#relations");
 const elErrorBanner = $("#errorBanner");
 const elErrorList = $("#errorList");
+const elCyclePlan = $("#cyclePlan");
 const elResultBody = $("#resultBody");
 const elStatus = $("#status");
 
@@ -54,10 +68,32 @@ function escapeHtml(s) {
 function scheduleSolve(delay = 200) {
   clearTimeout(solveTimer);
   solveTimer = setTimeout(runSolve, delay);
+  // 图层、样本或关系即将（重新）求解：旧方案与在途方案请求一律作废，
+  // 之后即使把输入改回原值，旧方案也不能恢复确认资格。
+  voidCyclePlan();
   markInferStaleness();
   markSuggestStaleness();
   markReviewStaleness();
   markTransitionStaleness();
+}
+
+// 成环方案的参与输入指纹：只覆盖图层、样本与关系（方案只依赖这三者）
+function cycleSignature(payload) {
+  return JSON.stringify({
+    layers: payload.layers,
+    samples: payload.samples,
+    relations: payload.relations,
+  });
+}
+
+function voidCyclePlan() {
+  cycleState.result = null;
+  cycleState.resultSig = "";
+  cycleState.solveCyclic = false;
+  cycleState.inflightId = 0;
+  cycleState.inflightSig = "";
+  // 立即撤下方案区（不必等防抖后的新求解返回）；错误横幅本身仍保留至新求解落地
+  if (elCyclePlan) refreshCyclePlanView();
 }
 
 // ------------------------------------------------------------ 渲染输入 --
@@ -384,6 +420,8 @@ document.addEventListener("click", (e) => {
     state.relations.splice(i, 1);
     render();
     scheduleSolve(0);
+  } else if (act === "cycle-confirm") {
+    confirmCyclePlan();
   } else if (act === "suggest-add" && suggestState.candidates.length < MAX_CANDIDATES) {
     suggestState.candidates.push("#808080");
     renderSuggestControls();
@@ -425,9 +463,15 @@ async function runSolve() {
     relations: state.relations.map((r) => ({ lower: r.lower, upper: r.upper })),
   };
 
+  // 新一轮求解开始：上一周期的方案（及其确认资格）与在途方案请求一律作废。
+  voidCyclePlan();
   const token = ++inflightToken;
   elStatus.textContent = "计算中…";
   elStatus.className = "status busy";
+
+  // 成环方案与原求解并行获取；方案请求自带单调序号与输入指纹守卫，
+  // 不受 /api/solve 结果先后顺序影响（见 cycleResponseCurrent）。
+  runCyclePlan(payload, token);
 
   try {
     const resp = await fetch("/api/solve", {
@@ -438,8 +482,15 @@ async function runSolve() {
     if (token !== inflightToken) return; // 已有更新的请求，丢弃旧结果
     const data = await resp.json();
     if (!resp.ok) {
-      showErrors(data.errors || [{ scope: "form", message: "求解失败" }]);
+      const errors = data.errors || [{ scope: "form", message: "求解失败" }];
+      // 只有原求解确认成环时，方案区才允许显示；其他非法输入不展示方案
+      cycleState.solveCyclic = errors.some(
+        (er) => er.scope === "relations" && String(er.message).includes("成环")
+      );
+      showErrors(errors);
+      refreshCyclePlanView();
     } else {
+      cycleState.solveCyclic = false;
       showErrors([]);
       lastSolveResult = data;
       renderResult(data);
@@ -447,7 +498,136 @@ async function runSolve() {
   } catch (err) {
     if (token !== inflightToken) return;
     showErrors([{ scope: "form", message: "无法连接计算服务：" + err.message }]);
+    refreshCyclePlanView();
   }
+}
+
+// 响应守卫：只有「当前在途的最近一次方案请求」且其图层/样本/关系指纹
+// 自发出后始终未变，响应才允许落地。reqSeq 永不归零，输入保持不变时连续
+// 求解同样安全：较早请求无论成功、HTTP 错误还是连接异常都只会被丢弃，
+// 不改动方案、错误提示与加载状态。
+function cycleResponseCurrent(reqId, reqSig) {
+  return (
+    cycleState.inflightId === reqId &&
+    cycleState.inflightSig === reqSig
+  );
+}
+
+async function runCyclePlan(payload, solveToken) {
+  const reqSig = cycleSignature(payload);
+  const reqId = ++cycleState.reqSeq;
+  cycleState.inflightId = reqId;
+  cycleState.inflightSig = reqSig;
+  refreshCyclePlanView();
+
+  try {
+    const resp = await fetch("/api/resolve-cycle", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json().catch(() => null);
+    if (!cycleResponseCurrent(reqId, reqSig)) return;
+    cycleState.inflightId = 0;
+    cycleState.inflightSig = "";
+    // HTTP 错误（含其他非法输入 400）或无法解析的响应都不更新方案视图；
+    // 原求解自身的错误提示已在错误横幅中给出。
+    if (resp.ok && data && data.cyclic === true) {
+      cycleState.result = data;
+      cycleState.resultSig = reqSig;
+    } else {
+      cycleState.result = null;
+      cycleState.resultSig = "";
+    }
+    if (solveToken === inflightToken) refreshCyclePlanView();
+  } catch (err) {
+    // 连接异常：旧/在途失效请求一律静默丢弃，不改动方案、错误与加载状态
+    if (!cycleResponseCurrent(reqId, reqSig)) return;
+    cycleState.inflightId = 0;
+    cycleState.inflightSig = "";
+    if (solveToken === inflightToken) refreshCyclePlanView();
+  }
+}
+
+// 按当前周期状态刷新方案区：加载占位 / 方案卡片 / 隐藏
+function refreshCyclePlanView() {
+  if (!cycleState.solveCyclic) {
+    elCyclePlan.hidden = true;
+    elCyclePlan.innerHTML = "";
+    return;
+  }
+  if (cycleState.result && cycleState.resultSig) {
+    renderCyclePlan(cycleState.result);
+    return;
+  }
+  const loading = cycleState.inflightId !== 0;
+  elCyclePlan.hidden = false;
+  elCyclePlan.innerHTML = loading
+    ? `<div class="cycle-plan-title">解除方案生成中…</div>`
+    : "";
+}
+
+function renderCyclePlan(r) {
+  const cr = r.cycleResolution || {};
+  const pairs = cr.removePairs || [];
+  const multiplicity = new Map();
+  const pairKey = (lo, up) => JSON.stringify([String(lo), String(up)]);
+  state.relations.forEach((rel) => {
+    const key = pairKey(rel.lower, rel.upper);
+    multiplicity.set(key, (multiplicity.get(key) || 0) + 1);
+  });
+  const pairRows = pairs
+    .map((p) => {
+      const dup = multiplicity.get(pairKey(p.lower, p.upper)) || 1;
+      const dupHint = dup > 1 ? ` <span class="cycle-dup">（含同向重复共 ${dup} 条，全部移除）</span>` : "";
+      return `<li><b class="hexval">${escapeHtml(p.lower)}</b> 在 <b class="hexval">${escapeHtml(
+        p.upper
+      )}</b> 下方${dupHint}</li>`;
+    })
+    .join("");
+  elCyclePlan.hidden = false;
+  elCyclePlan.innerHTML = `
+    <div class="cycle-plan-title">待确认的解除方案（不会自动修改输入）</div>
+    <div class="cycle-plan-desc">
+      删除下列 <b>${cr.removeCount}</b> 组不同关系对即可消除全部成环（含自环），
+      为可删除对数最少的方案；并列时按 (下方 ID, 上方 ID) 列表字典序取最小。
+      确认后一次性移除这些对的全部同向重复项（共 <b>${cr.removedDuplicateCount}</b> 条关系），
+      其余图层、样本与关系保留，并自动重新求解。
+    </div>
+    <ul class="cycle-pairs">${pairRows}</ul>
+    <div class="cycle-actions">
+      <button class="btn btn-small" data-act="cycle-confirm" type="button">
+        确认移除并重新求解
+      </button>
+      <span class="hint">图层、样本或关系一经变化，本方案即作废，需重新确认。</span>
+    </div>
+  `;
+}
+
+function confirmCyclePlan() {
+  const r = cycleState.result;
+  // 仅当方案是最近一次、且图层/样本/关系自方案产生后始终未变时允许确认；
+  // 先改后改回原值也不能恢复确认资格（resultSig 已被 voidCyclePlan 清空）。
+  if (!r || !cycleState.resultSig) return;
+  const currentSig = cycleSignature({
+    layers: state.layers.map((l) => ({ id: l.id, color: l.color, opacity: l.opacity })),
+    samples: state.samples.map((s) => ({ background: s.background, target: s.target })),
+    relations: state.relations.map((rel) => ({ lower: rel.lower, upper: rel.upper })),
+  });
+  if (currentSig !== cycleState.resultSig) return;
+
+  const remove = new Set(
+    (r.cycleResolution.removePairs || []).map((p) => JSON.stringify([p.lower, p.upper]))
+  );
+  // 一次性移除这些对的全部同向重复项，其他输入原样保留
+  state.relations = state.relations.filter(
+    (rel) => !remove.has(JSON.stringify([rel.lower, rel.upper]))
+  );
+  render();
+  markSuggestStaleness();
+  markReviewStaleness();
+  markTransitionStaleness();
+  runSolve();
 }
 
 function showErrors(errors) {

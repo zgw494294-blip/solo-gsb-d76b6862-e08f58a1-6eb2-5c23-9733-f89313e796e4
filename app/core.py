@@ -12,6 +12,10 @@
 - 过渡步骤规划：给出当前实际底→顶叠序与非负有限的过渡总误差上限，在
   「满足先后关系且旧样本总误差不超过上限」的状态图上，以相邻交换为边做 BFS，
   求交换次数最少的完整路径；并列时按每步交换前两层 ID 对序列的字典序决胜
+- 成环解除方案：先后关系成环时，在既有冲突提示旁给出待确认方案——删除
+  「不同关系对」最少且剩余关系无环的一组（同向重复按一对计、自环必删，
+  并列按待删对列表字典序决胜）；确认后一次性移除这些对的全部重复项并
+  触发原求解
 """
 
 from __future__ import annotations
@@ -158,6 +162,56 @@ def _find_cycle(adj: list[list[int]]) -> list[int] | None:
             if found is not None:
                 return found
     return None
+
+
+def _min_feedback_arc_set(
+    edges: list[tuple[int, int]],
+) -> tuple[list[tuple[int, int]], list[str]]:
+    """在至多 12 条有向边中求「删除后无环」的最少边集。
+
+    edges 已按 (lower, upper) 规范化下标去重。自环（lower == upper）一定成环，
+    必须删除；其余边按边数递增、同数按边列表字典序枚举子集，首个使剩余图无环
+    的子集即「条数最少、并列时列表字典序最小」的方案。返回 (待删边表, 冲突链)。
+    """
+    n_edges = len(edges)
+    # 自环只能靠删除自身解除，固定纳入方案；其余边参与组合枚举
+    self_loops = {i for i, (a, b) in enumerate(edges) if a == b}
+    others = [i for i in range(n_edges) if i not in self_loops]
+
+    nodes = sorted({v for a, b in edges for v in (a, b)})
+    index_of = {v: k for k, v in enumerate(nodes)}
+    m = len(nodes)
+    # 转成稠密下标表示，DFS 更快；边总数 ≤ 12，整体枚举至多 2^12 = 4096 个子集
+    edge_pairs = [(index_of[a], index_of[b]) for a, b in edges]
+    self_loop_set = {index_of[a] for a, b in edges if a == b}
+
+    def acyclic_without(removed: set[int]) -> bool:
+        if any(i not in removed for i in self_loops):
+            return False
+        adj: list[list[int]] = [[] for _ in range(m)]
+        for i, (a, b) in enumerate(edge_pairs):
+            if i not in removed:
+                adj[a].append(b)
+        return _find_cycle(adj) is None
+
+    fixed = set(self_loops)
+    for size in range(len(others) + 1):
+        # itertools.combinations 按下标递增产出，边表本身有序，
+        # 故同一删除条数下列举顺序就是待删边列表的字典序
+        for combo in itertools.combinations(others, size):
+            removed = fixed | set(combo)
+            if acyclic_without(removed):
+                chosen_idx = sorted(removed)
+                chosen = [edges[i] for i in chosen_idx]
+                # 冲突链取原始图（未删边）上的环，供与既有成环提示同口径展示
+                full_adj: list[list[int]] = [[] for _ in range(m)]
+                for a, b in edge_pairs:
+                    full_adj[a].append(b)
+                dense_chain = _find_cycle(full_adj)
+                assert dense_chain is not None
+                chain = [nodes[x] for x in dense_chain]  # 转回原图层下标
+                return chosen, chain
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 # --------------------------------------------------------- 输入解析（共用） --
@@ -463,6 +517,147 @@ def solve(payload: Any) -> dict[str, Any]:
         "feasibleCount": feasible_count,
         "samples": sample_results,
     }
+
+
+# --------------------------------------------------------- 成环解除方案 --
+
+
+def _raw_relations(payload: Any) -> list[Any]:
+    rels = payload.get("relations", []) if isinstance(payload, dict) else []
+    return rels if isinstance(rels, list) else []
+
+
+def _raw_pair_multiplicity(payload: Any, parsed: _Parsed) -> dict[tuple[int, int], int]:
+    """统计原始 relations 中每条规范化关系对的出现次数（同向重复逐条计）。"""
+    counts: dict[tuple[int, int], int] = {}
+    raw = _raw_relations(payload)
+    id_set = {lid for lid in parsed.ids if lid}
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        lower, upper = item.get("lower"), item.get("upper")
+        if (
+            isinstance(lower, str)
+            and isinstance(upper, str)
+            and lower.strip() in id_set
+            and upper.strip() in id_set
+        ):
+            key = (parsed.seen_ids[lower.strip()], parsed.seen_ids[upper.strip()])
+            counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def resolve_cycle(payload: Any) -> dict[str, Any]:
+    """先后关系成环时的待确认解除方案；亦可在确认后一次性移除并触发原求解。
+
+    - 非确认模式（默认）：沿用现有校验解析 layers / samples / relations，
+      其余非法输入照常报错；关系无环时返回空方案；成环时在既有冲突提示之外
+      给出「删除不同关系对最少、剩余关系无环」的方案，同向重复按一对计，
+      自环必须解除；并列时每组待删对按 (lower, upper) 字典序、列表同样
+      按字典序取最小。
+    - 确认模式（payload["confirm"] 为 true）：把方案中每一对的全部同向
+      重复项从请求中一次性移除，其余输入（图层、样本及未入选关系）原样
+      保留，随后执行与 solve 完全一致的原求解；无环或方案为空时等价于
+      直接原求解。方案始终以本次请求为唯一依据重新计算，确认资格不外置。
+    """
+    parsed, errors = _parse_inputs(payload)
+    if errors:
+        raise CalibrationError(errors)
+
+    # 规范化后的唯一有向边；决胜字典序以图层 ID 字符串为准（不是录入下标序），
+    # 同向重复此时已按一条计；该顺序即方案子集枚举与待删对列表的展示顺序
+    unique_pairs = sorted(
+        set(parsed.pairs),
+        key=lambda p: (parsed.ids[p[0]], parsed.ids[p[1]]),
+    )
+    n_unique = len(unique_pairs)
+    adj: list[list[int]] = [[] for _ in range(len(parsed.ids))]
+    for li, ui in unique_pairs:
+        adj[li].append(ui)
+    cycle = _find_cycle(adj)
+
+    confirm = isinstance(payload, dict) and payload.get("confirm") is True
+
+    if cycle is None:
+        raw_count = len(_raw_relations(payload))
+        removal = {
+            "removePairs": [],
+            "removeCount": 0,
+            "removedDuplicateCount": 0,
+            "remainingRelationCount": raw_count,
+        }
+        if not confirm:
+            return {
+                "cyclic": False,
+                "confirm": False,
+                "conflict": None,
+                "relationCount": raw_count,
+                "uniqueRelationCount": n_unique,
+                "cycleResolution": removal,
+            }
+        result = solve(payload)
+        result["cycleResolution"] = removal
+        return result
+
+    chosen, chain_idx = _min_feedback_arc_set(unique_pairs)
+    chain = " → ".join(parsed.ids[x] for x in chain_idx)
+    message = f"图层先后关系成环，存在冲突：{chain}（底 → 顶方向不能绕回自身）"
+    chosen_ids = [
+        {"lower": parsed.ids[li], "upper": parsed.ids[ui]} for li, ui in chosen
+    ]
+    chosen_keys = {(li, ui) for li, ui in chosen}
+
+    if not confirm:
+        raw_count = len(_raw_relations(payload))
+        multiplicity = _raw_pair_multiplicity(payload, parsed)
+        dup_total = sum(multiplicity.get(key, 0) for key in chosen_keys)
+        return {
+            "cyclic": True,
+            "confirm": False,
+            "conflict": {"scope": "relations", "message": message, "chain": chain},
+            "relationCount": raw_count,
+            "uniqueRelationCount": n_unique,
+            "cycleResolution": {
+                "removePairs": chosen_ids,
+                "removeCount": len(chosen_ids),
+                "removedDuplicateCount": dup_total,
+                "remainingRelationCount": raw_count - dup_total,
+            },
+        }
+
+    # ---- 确认：一次性移除这些对的全部同向重复项，其余输入原样保留 -----------
+    reduced = dict(payload)
+    reduced.pop("confirm", None)
+    kept_relations: list[Any] = []
+    removed_dup_count = 0
+    if isinstance(payload.get("relations"), list):
+        id_set = {lid for lid in parsed.ids if lid}
+        for item in payload["relations"]:
+            if not isinstance(item, dict):
+                kept_relations.append(item)  # 已通过解析校验，理论上不会出现
+                continue
+            lower, upper = item.get("lower"), item.get("upper")
+            if (
+                isinstance(lower, str)
+                and isinstance(upper, str)
+                and lower.strip() in id_set
+                and upper.strip() in id_set
+                and (parsed.seen_ids[lower.strip()], parsed.seen_ids[upper.strip()])
+                in chosen_keys
+            ):
+                removed_dup_count += 1
+                continue
+            kept_relations.append(item)
+    reduced["relations"] = kept_relations
+
+    result = solve(reduced)
+    result["cycleResolution"] = {
+        "removePairs": chosen_ids,
+        "removeCount": len(chosen_ids),
+        "removedDuplicateCount": removed_dup_count,
+        "remainingRelationCount": len(kept_relations),
+    }
+    return result
 
 
 # --------------------------------------------------------- 不透明度反推 --
