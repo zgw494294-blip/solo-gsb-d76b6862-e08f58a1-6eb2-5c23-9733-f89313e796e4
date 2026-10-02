@@ -58,6 +58,7 @@ function scheduleSolve(delay = 200) {
   markSuggestStaleness();
   markReviewStaleness();
   markTransitionStaleness();
+  markCycleStaleness();
 }
 
 // ------------------------------------------------------------ 渲染输入 --
@@ -411,8 +412,8 @@ function uniqueId(prefix) {
 
 // ------------------------------------------------------------ 调用后端 --
 
-async function runSolve() {
-  const payload = {
+function buildSolvePayload() {
+  return {
     layers: state.layers.map((l) => ({
       id: l.id,
       color: l.color,
@@ -424,6 +425,14 @@ async function runSolve() {
     })),
     relations: state.relations.map((r) => ({ lower: r.lower, upper: r.upper })),
   };
+}
+
+async function runSolve() {
+  // 成环确认请求在途时跳过自动求解：确认成功后会用删除关系后的输入触发求解；
+  // 确认被作废 / 失败后，用户的下一次输入会重新走「求解 → 方案」流程，避免
+  // 「在途确认尚未落地、自动求解先用旧关系渲染」造成的短暂不一致。
+  if (cycleState.confirmReqId !== 0) return;
+  const payload = buildSolvePayload();
 
   const token = ++inflightToken;
   elStatus.textContent = "计算中…";
@@ -438,10 +447,15 @@ async function runSolve() {
     if (token !== inflightToken) return; // 已有更新的请求，丢弃旧结果
     const data = await resp.json();
     if (!resp.ok) {
-      showErrors(data.errors || [{ scope: "form", message: "求解失败" }]);
+      const errors = data.errors || [{ scope: "form", message: "求解失败" }];
+      showErrors(errors);
+      // 是否成环、以及待确认解除方案，都以 /api/resolve-cycle 的判定为准；
+      // 其他非法输入（无环 / 混有别的错误）时该伴随请求不会展示方案卡片。
+      void runCyclePlan(payload, { silentOnError: true });
     } else {
       showErrors([]);
       lastSolveResult = data;
+      clearCyclePlan();
       renderResult(data);
     }
   } catch (err) {
@@ -789,6 +803,7 @@ document.addEventListener("click", (e) => {
   if (btn.dataset.act === "review-append") appendReviewSample();
   if (btn.dataset.act === "transition-run") runTransition();
   if (btn.dataset.act === "transition-reset") resetTransitionOrder();
+  if (btn.dataset.act === "cycle-confirm") confirmCyclePlan();
 });
 
 async function runInfer() {
@@ -1664,6 +1679,273 @@ function appendReviewSample() {
   markReviewStaleness();
   markTransitionStaleness();
   runSolve();
+}
+
+// ======================================================== 成环解除方案 ==
+
+const cycleState = {
+  plan: null,          // 最近一次成功获取的待确认方案（含冲突链与待删对）
+  planKey: "",         // 方案产生时的输入指纹（图层 / 样本 / 关系）
+  invalidated: false,  // 方案展示后输入是否曾变化过：一旦置位，改回原值也不复活
+  planReqId: 0,        // 当前仍可落地的在途「方案」请求序号；0 表示无
+  planReqSig: "",      // 在途方案请求发出时的输入指纹
+  confirmReqId: 0,     // 当前仍可落地的在途「确认」请求序号；0 表示无
+  confirmReqSig: "",   // 在途确认请求发出时的输入指纹
+  reqSeq: 0,           // 单调递增的请求序号源（方案/确认共用），永不归零
+};
+
+// 是否有在途的方案或确认请求
+function cycleBusy() {
+  return cycleState.planReqId !== 0 || cycleState.confirmReqId !== 0;
+}
+
+const elCycleCard = $("#cycleCard");
+const elCycleResult = $("#cycleResult");
+const elCycleErrors = $("#cycleErrors");
+const elCycleStatus = $("#cycleStatus");
+
+function cycleSignature(payload) {
+  // 方案仅取决于当前图层、样本与关系
+  return JSON.stringify({
+    layers: payload.layers,
+    samples: payload.samples,
+    relations: payload.relations,
+  });
+}
+
+function clearCyclePlan() {
+  cycleState.plan = null;
+  cycleState.planKey = "";
+  cycleState.invalidated = false;
+  cycleState.planReqId = 0;
+  cycleState.planReqSig = "";
+  cycleState.confirmReqId = 0;
+  cycleState.confirmReqSig = "";
+  elCycleCard.hidden = true;
+  elCycleResult.innerHTML = "";
+  elCycleErrors.hidden = true;
+  elCycleStatus.textContent = "";
+  elCycleStatus.className = "status";
+}
+
+// 输入（图层 / 样本 / 关系）变化时：在途的方案 / 确认请求若指纹与当前不一致则
+// 立即作废（加载态随之结束，旧响应在守卫处丢弃）；已展示方案一旦在获取后
+// 发生过任何变化即永久作废——改回原值也不能恢复确认资格。reqSeq 永不归零。
+function markCycleStaleness() {
+  const sig = cycleSignature(buildSolvePayload());
+  if (cycleState.planReqId !== 0 && sig !== cycleState.planReqSig) {
+    cycleState.planReqId = 0;
+    cycleState.planReqSig = "";
+  }
+  if (cycleState.confirmReqId !== 0 && sig !== cycleState.confirmReqSig) {
+    cycleState.confirmReqId = 0;
+    cycleState.confirmReqSig = "";
+  }
+  if (!cycleBusy()) {
+    elCycleStatus.textContent = "";
+    elCycleStatus.className = "status";
+  }
+  if (!cycleState.plan) return;
+  if (sig !== cycleState.planKey) cycleState.invalidated = true;
+  const dead = cycleState.invalidated;
+  const old = elCycleResult.querySelector(".stale-note");
+  const btn = elCycleResult.querySelector('button[data-act="cycle-confirm"]');
+  if (dead) {
+    if (!old) {
+      const note = document.createElement("div");
+      note.className = "stale-note";
+      note.textContent = "图层、样本或关系已变化，以下解除方案已作废（即使改回原值也不能再确认），请等待新方案。";
+      elCycleResult.prepend(note);
+    }
+    if (btn) btn.disabled = true;
+  } else if (old) {
+    old.remove();
+    if (btn) btn.disabled = false;
+  }
+}
+
+function cyclePlanFresh() {
+  return !!cycleState.plan &&
+    !cycleState.invalidated &&
+    cycleSignature(buildSolvePayload()) === cycleState.planKey;
+}
+
+// 响应守卫：只有「当前在途的该类请求」且「发出后输入始终未变」的响应可以
+// 更新方案 / 错误 / 加载状态；旧请求无论成功、HTTP 错误还是连接异常都丢弃。
+function cycleResponseCurrent(kind, reqId, reqSig) {
+  const id = kind === "confirm" ? cycleState.confirmReqId : cycleState.planReqId;
+  return (
+    id === reqId &&
+    cycleSignature(buildSolvePayload()) === reqSig
+  );
+}
+
+async function runCyclePlan(payload, opts = {}) {
+  // silentOnError：作为自动求解的伴随请求时，业务 400（其他非法输入）不单独
+  // 在卡片内报错——同样的错误已由顶部错误横幅展示；这里只需隐藏方案卡片。
+  const silentOnError = !!opts.silentOnError;
+  const reqId = ++cycleState.reqSeq;
+  cycleState.planReqId = reqId;
+  const reqSig = cycleSignature(payload);
+  cycleState.planReqSig = reqSig;
+
+  elCycleCard.hidden = false;
+  elCycleErrors.hidden = true;
+  elCycleStatus.textContent = "分析解除方案中…";
+  elCycleStatus.className = "status busy";
+  elCycleResult.innerHTML = `<div class="result-empty">正在从至多 ${MAX_RELATIONS} 条关系中寻找删去条数最少的一组…</div>`;
+
+  try {
+    const resp = await fetch("/api/resolve-cycle", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!cycleResponseCurrent("plan", reqId, reqSig)) return;
+    const data = await resp.json();
+    cycleState.planReqId = 0;
+    cycleState.planReqSig = "";
+    elCycleStatus.textContent = "";
+    elCycleStatus.className = "status";
+    if (!resp.ok) {
+      // 其他非法输入仍按现有规则报错：自动伴随模式下交给顶部横幅，这里仅隐藏卡片
+      if (!silentOnError) {
+        showCycleErrors(data.errors || [{ scope: "form", message: "解除方案分析失败" }]);
+        elCycleResult.innerHTML =
+          '<div class="result-empty">请先按顶部错误提示修正输入，再获取解除方案。</div>';
+      }
+      cycleState.plan = null;
+      cycleState.planKey = "";
+      cycleState.invalidated = false;
+      elCycleCard.hidden = true;
+      elCycleResult.innerHTML = "";
+      return;
+    }
+    if (!data.cyclic) {
+      // 无环：空方案，不展示卡片
+      clearCyclePlan();
+      return;
+    }
+    cycleState.plan = data;
+    cycleState.planKey = reqSig;
+    cycleState.invalidated = false;
+    renderCyclePlan(data, true);
+  } catch (err) {
+    if (!cycleResponseCurrent("plan", reqId, reqSig)) return;
+    cycleState.planReqId = 0;
+    cycleState.planReqSig = "";
+    elCycleStatus.textContent = "";
+    elCycleStatus.className = "status";
+    showCycleErrors([{ scope: "form", message: "无法连接计算服务：" + err.message }]);
+  }
+}
+
+function showCycleErrors(errors) {
+  elCycleErrors.innerHTML =
+    "<ul>" + errors.map((er) => `<li>${escapeHtml(er.message)}</li>`).join("") + "</ul>";
+  elCycleErrors.hidden = false;
+}
+
+function renderCyclePlan(plan, fresh) {
+  elCycleErrors.hidden = true;
+  const rows = plan.removePairs
+    .map((p, k) => `
+      <div class="cycle-pair-row${p.selfLoop ? " self-loop" : ""}">
+        <span class="row-index">${k + 1}</span>
+        <b class="hexval">${escapeHtml(p.lower)}</b>
+        <span class="relation-arrow">${p.selfLoop ? "↺ 自环（下方与上方是同一图层）" : "在更下方 ▲ 叠在"}</span>
+        ${p.selfLoop ? "" : `<b class="hexval">${escapeHtml(p.upper)}</b><span class="relation-arrow">之上</span>`}
+        <span class="spacer"></span>
+        <span class="hint">同向重复 ${p.occurrences} 条将一并移除</span>
+      </div>`)
+    .join("");
+
+  elCycleResult.innerHTML = `
+    <div class="cycle-conflict">
+      当前冲突链（底 → 顶）：<b class="hexval">${escapeHtml(plan.conflictChain)}</b>
+    </div>
+    <div class="suggest-sec-title">
+      待确认解除方案：删除 <b>${plan.removeCount}</b> 种关系
+      （覆盖 ${plan.removedOccurrences} 条同向重复输入；去重后共 ${plan.relationCount} 条关系）——
+      已保证删去种数最少且剩余关系无环，并列时取关系对列表字典序最小者
+    </div>
+    <div class="rows cycle-pairs">${rows}</div>
+    <div class="infer-actions">
+      <button class="btn btn-small" data-act="cycle-confirm" type="button"
+              ${fresh ? "" : "disabled"}>确认并移除这些关系后重新求解</button>
+      <span class="hint">不会自动修改；确认前其他输入保持原样，确认后一次性移除上述各对的全部重复项并触发原求解</span>
+    </div>
+  `;
+  if (!fresh) markCycleStaleness();
+}
+
+async function confirmCyclePlan() {
+  const plan = cycleState.plan;
+  if (!plan || !cyclePlanFresh()) return;
+  if (cycleState.confirmReqId !== 0) return; // 确认已在途，防重复点击
+
+  const payload = buildSolvePayload();
+  const reqId = ++cycleState.reqSeq;
+  cycleState.confirmReqId = reqId;
+  const reqSig = cycleSignature(payload);
+  cycleState.confirmReqSig = reqSig;
+
+  const body = {
+    ...payload,
+    removePairs: plan.removePairs.map((p) => ({ lower: p.lower, upper: p.upper })),
+  };
+
+  // 确认在途期间禁用按钮，待其成功（卡片随结果清除）或失败 / 作废后再处理
+  const confirmBtnEl = elCycleResult.querySelector('button[data-act="cycle-confirm"]');
+  if (confirmBtnEl) confirmBtnEl.disabled = true;
+  elCycleStatus.textContent = "确认移除并重新求解中…";
+  elCycleStatus.className = "status busy";
+  elCycleErrors.hidden = true;
+
+  try {
+    const resp = await fetch("/api/confirm-cycle-resolution", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!cycleResponseCurrent("confirm", reqId, reqSig)) return;
+    const data = await resp.json();
+    cycleState.confirmReqId = 0;
+    cycleState.confirmReqSig = "";
+    elCycleStatus.textContent = "";
+    elCycleStatus.className = "status";
+    if (!resp.ok) {
+      showCycleErrors(data.errors || [{ scope: "form", message: "确认解除失败" }]);
+      // 服务端认定方案已不匹配当前输入：本地同步作废，须重新获取方案
+      cycleState.plan = null;
+      cycleState.planKey = "";
+      cycleState.invalidated = false;
+      elCycleResult.innerHTML =
+        '<div class="result-empty">解除方案已失效，请在当前输入下重新获取方案。</div>';
+      return;
+    }
+    // 一次性移除这些对的全部重复项（按规范化 ID 匹配），保留其他输入
+    const removeSet = new Set(plan.removePairs.map((p) => `${p.lower.trim()} ${p.upper.trim()}`));
+    state.relations = state.relations.filter(
+      (r) => !removeSet.has(`${String(r.lower).trim()} ${String(r.upper).trim()}`)
+    );
+    render();
+    markInferStaleness();
+    markSuggestStaleness();
+    markReviewStaleness();
+    markTransitionStaleness();
+    clearCyclePlan();
+    showErrors([]);
+    lastSolveResult = data;
+    renderResult(data);
+  } catch (err) {
+    if (!cycleResponseCurrent("confirm", reqId, reqSig)) return;
+    cycleState.confirmReqId = 0;
+    cycleState.confirmReqSig = "";
+    elCycleStatus.textContent = "";
+    elCycleStatus.className = "status";
+    showCycleErrors([{ scope: "form", message: "无法连接计算服务：" + err.message }]);
+  }
 }
 
 // ------------------------------------------------------------ 启动 --

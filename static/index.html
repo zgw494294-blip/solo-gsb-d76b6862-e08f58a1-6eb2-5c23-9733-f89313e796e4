@@ -64,6 +64,16 @@
         </div>
       </div>
 
+      <!-- 先后关系成环解除 -->
+      <div class="card cycle-card" id="cycleCard" hidden>
+        <div class="card-head">
+          <h2>先后关系成环 · 待确认解除方案 <span class="hint">（不自动修改，确认后才移除）</span></h2>
+          <span id="cycleStatus" class="status"></span>
+        </div>
+        <div id="cycleResult"></div>
+        <div id="cycleErrors" class="infer-errors" hidden></div>
+      </div>
+
       <!-- 过渡步骤规划 -->
       <div class="card transition-card" id="transitionCard" hidden>
         <div class="card-head">

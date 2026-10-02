@@ -327,6 +327,229 @@ def _raise_if_cycle(parsed: _Parsed) -> None:
         )
 
 
+# ------------------------------------------------------- 成环解除方案 --
+
+
+def _acyclic_pairs(n: int, pairs: list[tuple[int, int]]) -> bool:
+    """去掉自环后，给定（已去重）有向边集合是否无环（Kahn 判环）。"""
+    indeg = [0] * n
+    adj: list[list[int]] = [[] for _ in range(n)]
+    for li, ui in pairs:
+        if li == ui:
+            return False
+        adj[li].append(ui)
+        indeg[ui] += 1
+    queue = deque(i for i in range(n) if indeg[i] == 0)
+    seen = 0
+    while queue:
+        u = queue.popleft()
+        seen += 1
+        for v in adj[u]:
+            indeg[v] -= 1
+            if indeg[v] == 0:
+                queue.append(v)
+    return seen == n
+
+
+def _minimum_feedback_pairs(parsed: _Parsed) -> list[tuple[int, int]]:
+    """在已去重关系边中求「删去条数最少且剩余无环」的一组下标对。
+
+    关系至多 12 条，直接按删除条数升序枚举子集；同条数时边按下标对
+    （(lower,upper) 数值对）字典序排列，故首个可行组合即规则要求的
+    最少条数并列中列表字典序最小者。自环必删（任何拓扑序都无法满足）。
+    """
+    n = len(parsed.ids)
+    edges = sorted(parsed.pairs)  # (lower 下标, upper 下标) 字典序
+    self_loops = {(i, i) for i in range(n)}
+    mandatory = [e for e in edges if e in self_loops]
+    rest = [e for e in edges if e not in self_loops]
+
+    # 先看仅删自环后是否已经无环（空方案也由此覆盖：edges 为空时无环）
+    kept0 = [e for e in rest]
+    if _acyclic_pairs(n, kept0):
+        return mandatory
+
+    m = len(rest)
+    for size in range(1, m + 1):
+        remove_rest: list[tuple[int, int]] | None = None
+        for combo in itertools.combinations(range(m), size):
+            drop = {rest[k] for k in combo}
+            kept = [e for e in rest if e not in drop]
+            if _acyclic_pairs(n, kept):
+                remove_rest = [rest[k] for k in combo]
+                break
+        if remove_rest is not None:
+            return mandatory + remove_rest
+    # 全删必然无环，不可达
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _cycle_chain(parsed: _Parsed) -> str:
+    """复用 _raise_if_cycle 的提示口径，返回当前关系图上的一条冲突链。"""
+    n = len(parsed.ids)
+    adj: list[list[int]] = [[] for _ in range(n)]
+    for li, ui in parsed.pairs:
+        adj[li].append(ui)
+    cycle = _find_cycle(adj)
+    if cycle is None:
+        return ""
+    return " → ".join(parsed.ids[x] for x in cycle)
+
+
+def _has_cycle(parsed: _Parsed) -> bool:
+    return bool(_cycle_chain(parsed))
+
+
+def resolve_cycle(payload: Any) -> dict[str, Any]:
+    """成环时给出待确认的最少解除方案；无环时方案为空。
+
+    其余输入非法（图层 / 样本 / 关系字段本身）仍按现有规则收集报错。
+    方案中的关系对以规范化 ID 表示并按 (lower, upper) 字典序排序；
+    occurrences 为该规范化对在原始 relations 中出现的次数（同向重复
+    在方案里只算一条，确认时这些重复项会被一并移除）。
+    """
+    parsed, errors = _parse_inputs(payload)
+    if errors:
+        raise CalibrationError(errors)
+
+    n = len(parsed.ids)
+    adj: list[list[int]] = [[] for _ in range(n)]
+    for li, ui in parsed.pairs:
+        adj[li].append(ui)
+    cycle = _find_cycle(adj)
+    if cycle is None:
+        return {
+            "cyclic": False,
+            "conflictChain": "",
+            "relationCount": len(parsed.pairs),
+            "removePairs": [],
+            "removeCount": 0,
+            "removedOccurrences": 0,
+        }
+
+    remove_idx = _minimum_feedback_pairs(parsed)
+    remove_set = set(remove_idx)
+
+    # 统计原始 relations（截断到上限后、字段合法的条目）中每个规范化对的出现次数
+    raw_relations = payload.get("relations", [])
+    if not isinstance(raw_relations, list):
+        raw_relations = []
+    occurrences: dict[tuple[int, int], int] = {}
+    id_set = {lid for lid in parsed.ids if lid}
+    for item in raw_relations[:MAX_RELATIONS]:
+        if not isinstance(item, dict):
+            continue
+        lower, upper = item.get("lower"), item.get("upper")
+        if not isinstance(lower, str) or lower.strip() not in id_set:
+            continue
+        if not isinstance(upper, str) or upper.strip() not in id_set:
+            continue
+        key = (parsed.seen_ids[lower.strip()], parsed.seen_ids[upper.strip()])
+        occurrences[key] = occurrences.get(key, 0) + 1
+
+    pairs_out = [
+        {
+            "lower": parsed.ids[li],
+            "upper": parsed.ids[ui],
+            "selfLoop": li == ui,
+            "occurrences": occurrences.get((li, ui), 1),
+        }
+        for li, ui in sorted(remove_set)
+    ]
+    return {
+        "cyclic": True,
+        "conflictChain": " → ".join(parsed.ids[x] for x in cycle),
+        "relationCount": len(parsed.pairs),
+        "removePairs": pairs_out,
+        "removeCount": len(pairs_out),
+        "removedOccurrences": sum(p["occurrences"] for p in pairs_out),
+    }
+
+
+def confirm_cycle_resolution(payload: Any) -> dict[str, Any]:
+    """确认解除方案：一次性移除指定关系对的全部同向重复项，随后触发原求解。
+
+    removePairs 必须与按当前输入算出的规范化最少方案完全一致（顺序无关，
+    多退少补均拒绝）——方案随输入变化即作废，改回原值也不能恢复确认资格。
+    """
+    parsed, errors = _parse_inputs(payload)
+    assert isinstance(payload, dict)  # _parse_inputs 已保证是 dict
+
+    raw_remove = payload.get("removePairs")
+    req_pairs: list[tuple[str, str]] = []
+    if not isinstance(raw_remove, list):
+        errors.append(
+            _err("cycleResolution", "缺少 removePairs 列表或其格式不正确：应为待删除关系对数组")
+        )
+    else:
+        seen_req: set[tuple[str, str]] = set()
+        id_set = {lid for lid in parsed.ids if lid}
+        for i, item in enumerate(raw_remove):
+            if not isinstance(item, dict):
+                errors.append(_err("cycleResolution", "待删除关系对格式不正确，应为对象", i))
+                continue
+            lower, upper = item.get("lower"), item.get("upper")
+            if not isinstance(lower, str) or lower.strip() not in id_set:
+                errors.append(
+                    _err("cycleResolution", f"待删除关系的下方图层 ID 不存在：{lower!r}", i)
+                )
+                continue
+            if not isinstance(upper, str) or upper.strip() not in id_set:
+                errors.append(
+                    _err("cycleResolution", f"待删除关系的上方图层 ID 不存在：{upper!r}", i)
+                )
+                continue
+            key = (lower.strip(), upper.strip())
+            if key in seen_req:
+                errors.append(
+                    _err(
+                        "cycleResolution",
+                        f"待删除关系对重复：{key[0]} → {key[1]}（同向重复只需列一次）",
+                        i,
+                    )
+                )
+                continue
+            seen_req.add(key)
+            req_pairs.append(key)
+
+    if errors:
+        raise CalibrationError(errors)
+
+    # 当前输入无环时唯一合法方案是空方案；有环时取规范化最少方案
+    canonical_idx = _minimum_feedback_pairs(parsed) if _has_cycle(parsed) else []
+    canonical = {(parsed.ids[li], parsed.ids[ui]) for li, ui in canonical_idx}
+    requested = set(req_pairs)
+    if requested != canonical:
+        raise CalibrationError(
+            [
+                _err(
+                    "cycleResolution",
+                    "解除方案已失效：图层、样本或关系已发生变化，请重新获取当前方案后再确认",
+                )
+            ]
+        )
+
+    # 一次性移除这些对的全部重复项（按规范化 ID 匹配），其余输入原样保留
+    kept_relations: list[Any] = []
+    raw_relations = payload.get("relations", [])
+    if isinstance(raw_relations, list):
+        for item in raw_relations:
+            if isinstance(item, dict):
+                lower = item.get("lower")
+                upper = item.get("upper")
+                if (
+                    isinstance(lower, str)
+                    and isinstance(upper, str)
+                    and (lower.strip(), upper.strip()) in canonical
+                ):
+                    continue
+            kept_relations.append(item)
+
+    solve_payload = {**payload, "relations": kept_relations}
+    solve_payload.pop("removePairs", None)
+    return solve(solve_payload)
+
+
 def _total_sse(
     parsed: _Parsed, order: list[int], alphas: list[float]
 ) -> float:

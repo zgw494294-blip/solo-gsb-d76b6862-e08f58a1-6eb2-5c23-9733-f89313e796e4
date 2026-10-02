@@ -646,3 +646,30 @@ input[type="color"] {
   align-items: center;
   flex-wrap: wrap;
 }
+
+/* ------------------------- 成环解除方案 ------------------------- */
+.cycle-card { margin-top: 16px; border-color: #d8b48a; }
+.cycle-conflict {
+  margin: 4px 0 10px;
+  font-size: 13px;
+  color: #92400e;
+  background: #fef6e7;
+  border: 1px solid #ecd3a4;
+  border-radius: 8px;
+  padding: 8px 12px;
+}
+.cycle-conflict .hexval {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.cycle-pairs { margin: 6px 0 4px; }
+.cycle-pair-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 10px;
+  background: #fbfcfe;
+  font-size: 13px;
+}
+.cycle-pair-row.self-loop { border-color: #f0b0b0; background: #fdf3f3; }

@@ -11,14 +11,16 @@ from fastapi.staticfiles import StaticFiles
 
 from .core import (
     CalibrationError,
+    confirm_cycle_resolution,
     infer_opacities,
     plan_transition,
+    resolve_cycle,
     review_measurement,
     solve,
     suggest_background,
 )
 
-app = FastAPI(title="透明图层叠序校准台", version="1.4.0")
+app = FastAPI(title="透明图层叠序校准台", version="1.5.0")
 
 
 @app.get("/api/health")
@@ -101,6 +103,38 @@ async def api_plan_transition(request: Request) -> JSONResponse:
         )
     try:
         result = plan_transition(payload)
+    except CalibrationError as exc:
+        return JSONResponse(status_code=400, content={"errors": exc.errors})
+    return JSONResponse(status_code=200, content=result)
+
+
+@app.post("/api/resolve-cycle")
+async def api_resolve_cycle(request: Request) -> JSONResponse:
+    try:
+        payload: Any = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={"errors": [{"scope": "form", "message": "请求体不是合法的 JSON"}]},
+        )
+    try:
+        result = resolve_cycle(payload)
+    except CalibrationError as exc:
+        return JSONResponse(status_code=400, content={"errors": exc.errors})
+    return JSONResponse(status_code=200, content=result)
+
+
+@app.post("/api/confirm-cycle-resolution")
+async def api_confirm_cycle_resolution(request: Request) -> JSONResponse:
+    try:
+        payload: Any = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={"errors": [{"scope": "form", "message": "请求体不是合法的 JSON"}]},
+        )
+    try:
+        result = confirm_cycle_resolution(payload)
     except CalibrationError as exc:
         return JSONResponse(status_code=400, content={"errors": exc.errors})
     return JSONResponse(status_code=200, content=result)
